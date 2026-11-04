@@ -97,8 +97,47 @@ dmesg | grep wg-obfuscator                    # wg-obfuscator mode on
 
 Проверка: `/opt/etc/init.d/S05wgobfs status`, `ndmc -c 'show interface Wireguard0'`.
 
-**Удаление:** сначала переведите туннели в режим «внешний»
-(`wgobfs-mode.sh set WireguardN external <секция>`), затем `opkg remove wgobfs-kmod` и перезагрузка.
+## Удаление
+
+Изменённый модуль остаётся в памяти до перезагрузки, а настройки туннелей (I5 и endpoint сервера) — в
+конфигурации роутера. Если удалить пакет, не вернув их, после перезагрузки туннели во встроенном режиме
+пойдут на сервер без обфускации и не подключатся. Поэтому порядок такой:
+
+1. **Вернуть туннели на внешний обфускатор** — для каждого туннеля, у которого задан режим:
+
+    ```sh
+    sh /opt/lib/wgobfs/wgobfs-mode.sh list                          # какие туннели под управлением
+    sh /opt/lib/wgobfs/wgobfs-mode.sh set Wireguard0 external main  # endpoint 127.0.0.1:<порт>, I5 сброшен
+    ```
+
+    Туннель, где I5 задавали вручную (без секции), возвращается командами роутера:
+
+    ```sh
+    ndmc -c 'interface Wireguard0 wireguard asc 0 0 0 0 0 1 2 3 4 0 0 "" "" "" "" ""'
+    ndmc -c 'interface Wireguard0 wireguard peer <ключ пира> endpoint 127.0.0.1:<порт обфускатора>'
+    ndmc -c 'system configuration save'
+    ```
+
+    Если внешний обфускатор больше не нужен, вместо этого укажите в туннеле адрес самого сервера WireGuard.
+
+2. **Удалить пакет и перезагрузить роутер** — перезагрузка возвращает стандартный модуль:
+
+    ```sh
+    opkg remove wgobfs-kmod
+    ndmc -c 'system reboot'
+    ```
+
+3. **Убрать оставшиеся файлы** (по желанию): пакет не удаляет режимы туннелей и состояние автозапуска.
+
+    ```sh
+    rm -rf /opt/etc/wgobfs-tunnels.conf /opt/var/lib/wgobfs
+    sed -i '/keenetic-wgobfs/d' /opt/etc/opkg.conf                  # строка репозитория
+    ```
+
+    `ip-full`, поставленный зависимостью, можно оставить или удалить: `opkg remove ip-full`.
+
+Проверка после перезагрузки: файла `/sys/module/wireguard/parameters/genl_id` нет (загружен стандартный
+модуль), туннели на связи в веб-интерфейсе роутера.
 
 ## Сборка
 
