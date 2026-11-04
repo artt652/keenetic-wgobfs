@@ -1,0 +1,97 @@
+name: Build
+
+# Every push: codec test, all module variants, the three packages.
+# Tag v*: also a GitHub release with the packages and the opkg feed on
+# GitHub Pages (Settings → Pages → Source: GitHub Actions; the github-pages
+# environment must allow tags v*).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: for f in files/*.sh files/S05wgobfs scripts/*.sh test/run.sh; do sh -n "$f" || bash -n "$f"; done
+      - name: Codec against wg-obfuscator v1.6
+        run: sudo apt-get install -y zlib1g-dev && test/run.sh
+      - name: Router tool builds
+        run: gcc -O2 -Wall -Wextra -Werror -o /tmp/wgobfs-tool tools/wgobfs-tool.c
+
+  variants:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [mt7621, mt7621-hm, en7528, mt7628-1713, en7512, en7516, mt7622, mt7981, mt7988]
+    steps:
+      - uses: actions/checkout@v4
+      - name: SDK prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y attr bc bsdmainutils build-essential curl file gawk git gperf jq \
+            libhtml-parser-perl libjson-perl libncurses-dev libssl-dev libxml-libxml-perl lzip \
+            protobuf-c-compiler python3 subversion unzip zlib1g-dev xxd zstd
+      - name: Build ${{ matrix.variant }}
+        run: scripts/build-variant.sh ${{ matrix.variant }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: variant-${{ matrix.variant }}
+          path: |
+            out/${{ matrix.variant }}/
+            !out/${{ matrix.variant }}/*-stock.ko
+
+  package:
+    needs: [test, variants]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: variant-*
+          path: artifacts
+      - name: Collect variants
+        run: |
+          mkdir -p out
+          for d in artifacts/variant-*; do v=${d#artifacts/variant-}; cp -r "$d" "out/$v"; done
+          chmod +x out/*/wgobfs-tool
+          cat out/*/index
+      - name: Packages
+        run: |
+          for a in mipsel-3.4 mips-3.4 aarch64-3.10; do scripts/build-ipk.sh "$a"; done
+          scripts/make-feed.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: out/*.ipk
+      - uses: actions/upload-pages-artifact@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          path: dist
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.ipk
+
+  pages:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

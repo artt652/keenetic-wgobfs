@@ -1,0 +1,104 @@
+#!/bin/sh
+# Entware init script: at boot, replaces the stock WireGuard module with the
+# build that has wg-obfuscator support (see /opt/lib/wgobfs/wgobfs-swap.sh).
+#
+# Safety:
+#  - before the swap a "pending" mark is written to storage and removed once
+#    the swap finished. If the router crashed during the swap, the mark is
+#    still there at the next boot: autostart then disables itself, and the
+#    router keeps the stock module (no reboot loop);
+#  - the module is picked by the .text hash of the stock wireguard.ko of the
+#    running firmware; after a firmware update with no matching build in the
+#    package, the swap is skipped;
+#  - after that, wgobfs-mode.sh switches tunnels in "auto" mode to the
+#    built-in obfuscator or back to the external one, whichever works.
+#
+#   S05wgobfs start | stop | status | enable | disable
+
+DIR=/opt/lib/wgobfs
+VAR=/opt/var/lib/wgobfs
+SWAP=$DIR/wgobfs-swap.sh
+WAIT_S=120
+
+log() { echo "wgobfs: $*"; logger -t wgobfs "$*" 2>/dev/null; }
+
+# Waits until NDM has created the WireGuard netdevs of all configured
+# WireguardN interfaces (or the time is up).
+wait_ndm() {
+	t=0
+	while [ $t -lt $WAIT_S ]; do
+		want=$(ndmc -c 'show running-config' 2>/dev/null | grep -c '^interface Wireguard[0-9]')
+		have=$(/opt/sbin/ip -d -o link show 2>/dev/null | grep -c ' wireguard')
+		[ "${want:-0}" -gt 0 ] && [ "$have" -ge "$want" ] && return 0
+		sleep 5; t=$((t + 5))
+	done
+	log "timed out waiting for the WireGuard interfaces (have ${have:-0} of ${want:-0})"
+	return 1
+}
+
+# Picks the module for the running firmware; the link wireguard.ko and the
+# kernel mark are what the web panel reads.
+pick() {
+	sel=$(sh "$SWAP" select 2>/dev/null) || return 1
+	ln -sf "${sel%% *}" "$DIR/wireguard.ko"
+	cat /proc/version >"$VAR/kernel"
+	log "module for this firmware: ${sel#* }"
+}
+
+start() {
+	mkdir -p "$VAR"
+	swap=yes
+	if [ -f "$VAR/disabled" ]; then
+		log "autostart disabled ($(cat "$VAR/disabled")); stock module stays"
+		swap=no
+	elif [ -f "$VAR/pending" ]; then
+		echo "previous swap did not finish ($(cat "$VAR/pending"))" >"$VAR/disabled"
+		rm -f "$VAR/pending"; sync
+		log "previous swap did not finish, autostart disabled; stock module stays"
+		swap=no
+	elif ! pick; then
+		log "no module in the package fits this firmware (stock .text $(cut -c1-12 /tmp/wgobfs-swap/stock-text 2>/dev/null)); stock module stays"
+		swap=no
+	elif [ -e /sys/module/wireguard/parameters/genl_id ]; then
+		log "patched module already loaded"
+		swap=no
+	fi
+	# Background: Entware init must not block the boot for minutes.
+	(
+		wait_ndm || exit 1
+		if [ $swap = yes ]; then
+			date >"$VAR/pending"; sync
+			if sh "$SWAP" swap >"$VAR/last.log" 2>&1; then
+				log "patched module loaded: $(grep -E 'family id|netdevs now' "$VAR/last.log" | tr '\n' ' ')"
+			else
+				log "swap failed, see $VAR/last.log; reboot to be sure the stock module is back"
+			fi
+			rm -f "$VAR/pending"; sync
+			sleep 3
+		fi
+		# Tunnels in "auto" follow the module: built-in obfuscator when the
+		# patched module is loaded, the external one otherwise.
+		sh "$DIR/wgobfs-mode.sh" apply >>"$VAR/last.log" 2>&1
+	) &
+}
+
+case "$1" in
+start) start ;;
+stop) log "the patched module stays until reboot" ;;
+restart) start ;;
+status)
+	[ -e /sys/module/wireguard/parameters/genl_id ] && echo "patched module loaded" || echo "stock module"
+	sh "$SWAP" select 2>&1
+	sh "$DIR/wgobfs-mode.sh" list
+	[ -f "$VAR/disabled" ] && echo "autostart disabled: $(cat "$VAR/disabled")" || echo "autostart enabled"
+	[ -f "$VAR/last.log" ] && tail -n 4 "$VAR/last.log" ;;
+enable)
+	mkdir -p "$VAR"; rm -f "$VAR/disabled" "$VAR/pending"
+	if pick; then echo "autostart enabled: $(sh "$SWAP" select)"
+	else echo "autostart enabled, but no module in the package fits this firmware yet"; fi
+	sync ;;
+disable)
+	mkdir -p "$VAR"; echo "disabled by hand $(date)" >"$VAR/disabled"; sync
+	echo "autostart disabled" ;;
+*) echo "usage: $0 start|stop|status|enable|disable"; exit 2 ;;
+esac

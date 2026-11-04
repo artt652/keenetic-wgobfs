@@ -1,0 +1,715 @@
+diff --git a/src/Kbuild b/src/Kbuild
+index 908568d..b921249 100644
+--- a/src/Kbuild
++++ b/src/Kbuild
+@@ -8,7 +8,7 @@ ccflags-y += -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'
+ ccflags-y += -Wframe-larger-than=2048
+ ccflags-$(if $(WIREGUARD_VERSION),y,) += -D'WIREGUARD_VERSION="$(WIREGUARD_VERSION)"'
+ 
+-wireguard-y := main.o noise.o device.o peer.o timers.o queueing.o send.o receive.o socket.o peerlookup.o allowedips.o ratelimiter.o cookie.o netlink.o junk.o magic_header.o header_protection.o
++wireguard-y := main.o noise.o device.o peer.o timers.o queueing.o send.o receive.o socket.o peerlookup.o allowedips.o ratelimiter.o cookie.o netlink.o junk.o magic_header.o header_protection.o wgobfs.o
+ xt_WGOBFS-y := obfs/chacha.o obfs/xt_WGOBFS_main.o
+ 
+ include $(src)/crypto/Kbuild.include
+diff --git a/src/device.c b/src/device.c
+index dcca059..90c9f23 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -256,6 +256,8 @@ static void wg_destruct(struct net_device *dev)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(wg->ispecs); ++i)
+ 		jp_spec_free(&wg->ispecs[i]);
++	kfree(rcu_dereference_protected(wg->wgobfs, true));
++	RCU_INIT_POINTER(wg->wgobfs, NULL);
+ 
+ 	rtnl_lock();
+ 	list_del(&wg->device_list);
+@@ -640,6 +642,9 @@ int wg_device_handle_post_config(struct net_device *dev, struct asc_config *asc)
+ 		a_sec_on = true;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(wg->ispecs); ++i) {
++		/* In wg-obfuscator mode I5 carries its settings, not a packet. */
++		if (i == 4 && rcu_access_pointer(wg->wgobfs))
++			continue;
+ 		if (wg->ispecs[i].desc && wg->ispecs[i].desc[0] != '\0')
+ 			a_sec_on = true;
+ 		err = jp_spec_setup(&wg->ispecs[i]);
+@@ -652,5 +657,25 @@ int wg_device_handle_post_config(struct net_device *dev, struct asc_config *asc)
+ 
+ 	wg->advanced_security_config.advanced_security = a_sec_on;
+ out:
++	/* In wg-obfuscator mode the packets must stay plain WireGuard before
++	 * the obfuscation layer: drop junk packets, S paddings and H headers,
++	 * whatever the user interface insisted on.
++	 */
++	if (rcu_access_pointer(wg->wgobfs)) {
++		memset(wg->junk_size, 0, sizeof(wg->junk_size));
++		wg->headers[MSGIDX_HANDSHAKE_INIT] = (struct magic_header) {
++			MESSAGE_HANDSHAKE_INITIATION, MESSAGE_HANDSHAKE_INITIATION };
++		wg->headers[MSGIDX_HANDSHAKE_RESPONSE] = (struct magic_header) {
++			MESSAGE_HANDSHAKE_RESPONSE, MESSAGE_HANDSHAKE_RESPONSE };
++		wg->headers[MSGIDX_HANDSHAKE_COOKIE] = (struct magic_header) {
++			MESSAGE_HANDSHAKE_COOKIE, MESSAGE_HANDSHAKE_COOKIE };
++		wg->headers[MSGIDX_TRANSPORT] = (struct magic_header) {
++			MESSAGE_DATA, MESSAGE_DATA };
++		wg->advanced_security_config.junk_packet_count = 0;
++		wg->advanced_security_config.junk_packet_min_size = 0;
++		wg->advanced_security_config.junk_packet_max_size = 0;
++		wg->advanced_security_config.advanced_security = false;
++		ret = 0;
++	}
+ 	return ret;
+ }
+diff --git a/src/device.h b/src/device.h
+index 8965124..a1e0a08 100644
+--- a/src/device.h
++++ b/src/device.h
+@@ -12,6 +12,7 @@
+ #include "peerlookup.h"
+ #include "cookie.h"
+ #include "magic_header.h"
++#include "wgobfs.h"
+ #include "header_protection.h"
+ 
+ #include <linux/types.h>
+@@ -108,6 +109,7 @@ struct wg_device {
+ 	bool disable_cookies;
+ 	bool debug;
+ 	char ndm_dev_name[WG_NDM_NAME_SIZE];
++	struct wgobfs_cfg __rcu *wgobfs; /* wg-obfuscator mode, from I5 */
+ 
+ 	struct jp_spec ispecs[5];
+ 	struct magic_header headers[4];
+diff --git a/src/netlink.c b/src/netlink.c
+index 0d5c39e..4dc6243 100644
+--- a/src/netlink.c
++++ b/src/netlink.c
+@@ -13,6 +13,7 @@
+ #include "uapi/wireguard.h"
+ #include <linux/if.h>
+ #include <net/genetlink.h>
++#include <linux/moduleparam.h>
+ #include <net/sock.h>
+ #include <crypto/algapi.h>
+ 
+@@ -693,6 +694,43 @@ out:
+ 	return ret;
+ }
+ 
++/* I5 starting with the WGOB magic switches the device into wg-obfuscator
++ * mode (see wgobfs.h); any other I5 value, or an empty one, switches it off.
++ * Called with device_update_lock held.
++ */
++static int set_wgobfs(struct wg_device *wg, const char *spec)
++{
++	struct wgobfs_cfg *cfg, *old;
++	int ret;
++
++	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
++	if (!cfg)
++		return -ENOMEM;
++	ret = wgobfs_parse_spec(spec, cfg);
++	if (ret <= 0) {
++		kfree(cfg);
++		cfg = NULL;
++		if (ret < 0) {
++			net_info_ratelimited("%s: invalid wg-obfuscator settings in I5\n",
++					    wg->ndm_dev_name);
++			return ret;
++		}
++	}
++	old = rcu_dereference_protected(wg->wgobfs,
++					lockdep_is_held(&wg->device_update_lock));
++	rcu_assign_pointer(wg->wgobfs, cfg);
++	if (old)
++		kfree_rcu(old, rcu);
++	if (cfg)
++		net_info_ratelimited("%s: wg-obfuscator mode on, masking %s, max dummy %u\n",
++				    wg->ndm_dev_name,
++				    cfg->masking == WGOBFS_MASKING_STUN ? "STUN" : "none",
++				    cfg->max_dummy);
++	else if (old)
++		net_info_ratelimited("%s: wg-obfuscator mode off\n", wg->ndm_dev_name);
++	return 0;
++}
++
+ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct wg_device *wg = lookup_interface(info->attrs, skb);
+@@ -899,6 +937,9 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
+ 			ret = -ENOMEM;
+ 			goto out;
+ 		}
++		ret = set_wgobfs(wg, wg->ispecs[4].desc);
++		if (ret)
++			goto out;
+ 	}
+ 
+ 	if (info->attrs[WGDEVICE_A_CONTENT_PADDING_ADDITION]) {
+@@ -1128,8 +1169,18 @@ __ro_after_init = {
+ 	.netnsok = true
+ };
+ 
++/* Keep the generic netlink family id of the module being replaced, so the
++ * Keenetic configuration daemon, which resolves the id only once at boot,
++ * can keep talking to us after a hot swap (rmmod/insmod).
++ */
++static ushort genl_id;
++module_param(genl_id, ushort, 0444);
++MODULE_PARM_DESC(genl_id, "generic netlink family id to register with (0: allocate)");
++
+ int __init wg_genetlink_init(void)
+ {
++	if (genl_id)
++		genl_family.id = genl_id;
+ 	return genl_register_family(&genl_family);
+ }
+ 
+diff --git a/src/peer.h b/src/peer.h
+index 6468abd..9bfc188 100644
+--- a/src/peer.h
++++ b/src/peer.h
+@@ -71,6 +71,7 @@ struct wg_peer {
+ 	u32 client_id;
+ 	atomic_t jp_packet_counter;
+ 	bool advanced_security;
++	u64 wgobfs_last_stun; /* jiffies64 of the last STUN binding request */
+ };
+ 
+ struct wg_peer *wg_peer_create(struct wg_device *wg,
+diff --git a/src/receive.c b/src/receive.c
+index 2633280..04b32d5 100644
+--- a/src/receive.c
++++ b/src/receive.c
+@@ -260,6 +260,17 @@ static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
+ 	if (unlikely(skb->len != data_len))
+ 		/* Final len does not agree with calculated len */
+ 		return -EINVAL;
++	if (rcu_access_pointer(wg->wgobfs)) {
++		struct wgobfs_cfg *cfg;
++		int ret;
++
++		rcu_read_lock_bh();
++		cfg = rcu_dereference_bh(wg->wgobfs);
++		ret = cfg ? wgobfs_decode_skb(cfg, skb) : 0;
++		rcu_read_unlock_bh();
++		if (ret)
++			return ret;
++	}
+ 	header_len = prepare_awg_message(skb, wg);
+ 	if (unlikely(!header_len))
+ 		return -EINVAL;
+diff --git a/src/socket.c b/src/socket.c
+index ae74bd1..e9feb0d 100644
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -18,9 +18,19 @@
+ #include <net/udp_tunnel.h>
+ #include <net/ipv6.h>
+ 
++/* wg-obfuscator mode: obfuscate the outgoing message. Called under
++ * rcu_read_lock_bh().
++ */
++static int wgobfs_encode(struct wg_device *wg, struct sk_buff *skb)
++{
++	struct wgobfs_cfg *cfg = rcu_dereference_bh(wg->wgobfs);
++
++	return cfg ? wgobfs_encode_skb(cfg, skb) : 0;
++}
++
+ static int send4(struct wg_device *wg, struct sk_buff *skb,
+ 		 struct endpoint *endpoint, u8 ds, struct dst_cache *cache,
+-		 const u32 fwmark)
++		 const u32 fwmark, bool raw)
+ {
+ 	struct flowi4 fl = {
+ 		.saddr = endpoint->src4.s_addr,
+@@ -45,6 +55,12 @@ static int send4(struct wg_device *wg, struct sk_buff *skb,
+ 		goto err;
+ 	}
+ 
++	if (!raw) {
++		ret = wgobfs_encode(wg, skb);
++		if (unlikely(ret))
++			goto err;
++	}
++
+ 	fl.fl4_sport = inet_sk(sock)->inet_sport;
+ 
+ 	if (cache)
+@@ -98,7 +114,7 @@ out:
+ 
+ static int send6(struct wg_device *wg, struct sk_buff *skb,
+ 		 struct endpoint *endpoint, u8 ds, struct dst_cache *cache,
+-		 const u32 fwmark)
++		 const u32 fwmark, bool raw)
+ {
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	struct flowi6 fl = {
+@@ -126,6 +142,12 @@ static int send6(struct wg_device *wg, struct sk_buff *skb,
+ 		goto err;
+ 	}
+ 
++	if (!raw) {
++		ret = wgobfs_encode(wg, skb);
++		if (unlikely(ret))
++			goto err;
++	}
++
+ 	fl.fl6_sport = inet_sk(sock)->inet_sport;
+ 
+ 	if (cache)
+@@ -167,7 +189,8 @@ out:
+ #endif
+ }
+ 
+-int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
++static int send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds,
++			    bool raw)
+ {
+ 	size_t skb_len = skb->len;
+ 	int ret = -EAFNOSUPPORT;
+@@ -177,10 +200,10 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+ 	read_lock_bh(&peer->endpoint_lock);
+ 	if (peer->endpoint.addr.sa_family == AF_INET)
+ 		ret = send4(peer->device, skb, &peer->endpoint, ds,
+-			    &peer->endpoint_cache, fwmark);
++			    &peer->endpoint_cache, fwmark, raw);
+ 	else if (peer->endpoint.addr.sa_family == AF_INET6)
+ 		ret = send6(peer->device, skb, &peer->endpoint, ds,
+-			    &peer->endpoint_cache, fwmark);
++			    &peer->endpoint_cache, fwmark, raw);
+ 	else
+ 		dev_kfree_skb(skb);
+ 	if (likely(!ret))
+@@ -190,6 +213,48 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+ 	return ret;
+ }
+ 
++/* STUN masking: a Binding Request goes out before every handshake initiation
++ * and at least every WGOBFS_STUN_INTERVAL_S seconds while there is traffic,
++ * so the flow looks like a STUN session, as with the wg-obfuscator client.
++ */
++static void wgobfs_maybe_send_stun(struct wg_peer *peer, struct sk_buff *skb)
++{
++	struct wg_device *wg = peer->device;
++	struct wgobfs_cfg *cfg;
++	struct sk_buff *req;
++	bool stun, handshake;
++	u64 now = get_jiffies_64();
++
++	rcu_read_lock_bh();
++	cfg = rcu_dereference_bh(wg->wgobfs);
++	stun = cfg && cfg->masking == WGOBFS_MASKING_STUN;
++	rcu_read_unlock_bh();
++	if (!stun)
++		return;
++
++	handshake = skb->len >= 4 &&
++		    le32_to_cpu(((struct message_header *)skb->data)->type) ==
++			    MESSAGE_HANDSHAKE_INITIATION;
++	if (!handshake && time_before64(now, READ_ONCE(peer->wgobfs_last_stun) +
++					      WGOBFS_STUN_INTERVAL_S * HZ))
++		return;
++	WRITE_ONCE(peer->wgobfs_last_stun, now);
++
++	req = alloc_skb(SKB_HEADER_LEN + 32, GFP_ATOMIC);
++	if (unlikely(!req))
++		return;
++	skb_reserve(req, SKB_HEADER_LEN);
++	skb_set_inner_network_header(req, 0);
++	skb_put(req, wgobfs_stun_binding_request(req->data));
++	send_skb_to_peer(peer, req, 0, true);
++}
++
++int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
++{
++	wgobfs_maybe_send_stun(peer, skb);
++	return send_skb_to_peer(peer, skb, ds, false);
++}
++
+ int wg_socket_send_buffer_to_peer(struct wg_peer *peer, void *buffer,
+ 				  size_t len, u8 ds, size_t junk_size, bool trailer)
+ {
+@@ -276,9 +341,9 @@ int wg_socket_send_buffer_as_reply_to_skb(struct wg_device *wg,
+ 					   message, len);
+ 
+ 	if (endpoint.addr.sa_family == AF_INET)
+-		ret = send4(wg, skb, &endpoint, 0, NULL, 0);
++		ret = send4(wg, skb, &endpoint, 0, NULL, 0, false);
+ 	else if (endpoint.addr.sa_family == AF_INET6)
+-		ret = send6(wg, skb, &endpoint, 0, NULL, 0);
++		ret = send6(wg, skb, &endpoint, 0, NULL, 0, false);
+ 	/* No other possibilities if the endpoint is valid, which it is,
+ 	 * as we checked above.
+ 	 */
+diff --git a/src/wgobfs.c b/src/wgobfs.c
+new file mode 100644
+index 0000000..37dbd61
+--- /dev/null
++++ b/src/wgobfs.c
+@@ -0,0 +1,290 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Client side of the wg-obfuscator wire protocol. See wgobfs.h.
++ *
++ * Wire format of an obfuscated packet (obfuscation version 1):
++ *   - take the WireGuard message M (type in the first byte, bytes 1..3 are
++ *     zero in WireGuard);
++ *   - pick r in 1..255: byte0 ^= r, byte1 = r;
++ *   - if |M| < 1024: pick a padding length d (handshake init/response: below
++ *     min(1024-|M|, 512); cookie/data: below min(1024-|M|, max_dummy)),
++ *     store d little-endian in bytes 2..3, append d bytes of 0xFF;
++ *   - XOR the whole packet with a keystream: s = 0; for each byte i,
++ *     s = crc8(s, key[i % klen] + (total_len & 0xFF) + klen) with the
++ *     reflected polynomial 0x8C, output byte i ^= s.
++ * STUN masking wraps that in a STUN Data Indication (type 0x0115, magic
++ * cookie, random transaction id, DATA attribute 0x0013).
++ */
++
++#include "wgobfs.h"
++
++#include <linux/kernel.h>
++#include <linux/skbuff.h>
++#include <linux/string.h>
++#include <linux/ctype.h>
++#include <linux/random.h>
++#include <linux/crc32.h>
++#include <linux/netdevice.h>
++#include <asm/unaligned.h>
++
++#define WG_TYPE_MIN 1
++#define WG_TYPE_MAX 4
++#define WG_TYPE_HANDSHAKE_INIT 1
++#define WG_TYPE_HANDSHAKE_RESP 2
++
++#define STUN_COOKIE 0x2112A442U
++#define STUN_DATA_INDICATION 0x0115
++#define STUN_BINDING_REQUEST 0x0001
++#define STUN_ATTR_DATA 0x0013
++#define STUN_ATTR_FINGERPRINT 0x8028
++#define STUN_FINGERPRINT_XOR 0x5354554eU
++
++static u8 crc_state_tab[256];	/* one CRC8 step of the state, input 0 */
++static u8 crc_input_tab[256];	/* one CRC8 step of the input, state 0 */
++static bool crc_ready;
++
++static u8 crc8_bits(u8 crc, u8 in)
++{
++	int bit;
++
++	for (bit = 0; bit < 8; ++bit) {
++		u8 lsb = (crc ^ in) & 1;
++
++		crc >>= 1;
++		if (lsb)
++			crc ^= 0x8C;
++		in >>= 1;
++	}
++	return crc;
++}
++
++static void crc_init(void)
++{
++	int i;
++
++	if (likely(READ_ONCE(crc_ready)))
++		return;
++	/* CRC8 with this polynomial is linear: step(s, x) = step(s, 0) ^ step(0, x). */
++	for (i = 0; i < 256; ++i) {
++		crc_state_tab[i] = crc8_bits((u8)i, 0);
++		crc_input_tab[i] = crc8_bits(0, (u8)i);
++	}
++	smp_wmb();
++	WRITE_ONCE(crc_ready, true);
++}
++
++static void keystream_xor(const struct wgobfs_cfg *cfg, u8 *data,
++			  unsigned int len)
++{
++	const u8 mix = (u8)(len + cfg->key_len);
++	unsigned int i, k = 0;
++	u8 s = 0;
++
++	crc_init();
++	for (i = 0; i < len; ++i) {
++		s = crc_state_tab[s] ^ crc_input_tab[(u8)(cfg->key[k] + mix)];
++		data[i] ^= s;
++		if (++k == cfg->key_len)
++			k = 0;
++	}
++}
++
++static inline bool is_wg_type(const u8 *data)
++{
++	u32 type = get_unaligned_le32(data);
++
++	return type >= WG_TYPE_MIN && type <= WG_TYPE_MAX;
++}
++
++static int hexval(char c)
++{
++	if (c >= '0' && c <= '9')
++		return c - '0';
++	c = tolower(c);
++	if (c >= 'a' && c <= 'f')
++		return c - 'a' + 10;
++	return -1;
++}
++
++int wgobfs_parse_spec(const char *spec, struct wgobfs_cfg *cfg)
++{
++	static const char prefix[] = "<b 0x57474f42";
++	u8 raw[4 + WGOBFS_KEY_MAX + 1];
++	size_t n = 0, plen = sizeof(prefix) - 1;
++	const char *p;
++
++	if (!spec)
++		return 0;
++	while (isspace(*spec))
++		++spec;
++	if (strncasecmp(spec, prefix, plen))
++		return 0;
++	/* Hex digits after the magic, up to '>'. */
++	for (p = spec + plen; *p && *p != '>'; p += 2) {
++		int hi = hexval(p[0]), lo = p[1] ? hexval(p[1]) : -1;
++
++		if (hi < 0 || lo < 0 || n >= sizeof(raw))
++			return -EINVAL;
++		raw[n++] = (u8)(hi << 4 | lo);
++	}
++	if (*p != '>')
++		return -EINVAL;
++	/* version, masking, max_dummy(2), key(>=1) */
++	if (n < 5 || raw[0] != 1 || raw[1] > WGOBFS_MASKING_STUN)
++		return -EINVAL;
++	memset(cfg, 0, sizeof(*cfg));
++	cfg->masking = raw[1];
++	cfg->max_dummy = min_t(u16, get_unaligned_be16(raw + 2), WGOBFS_MAX_TOTAL);
++	cfg->key_len = n - 4;
++	if (cfg->key_len > WGOBFS_KEY_MAX)
++		return -EINVAL;
++	memcpy(cfg->key, raw + 4, cfg->key_len);
++	return 1;
++}
++
++static u16 pick_dummy(const struct wgobfs_cfg *cfg, u8 type, unsigned int len)
++{
++	unsigned int room, limit;
++
++	if (len >= WGOBFS_MAX_TOTAL)
++		return 0;
++	room = WGOBFS_MAX_TOTAL - len;
++	if (type == WG_TYPE_HANDSHAKE_INIT || type == WG_TYPE_HANDSHAKE_RESP)
++		limit = min_t(unsigned int, room, WGOBFS_MAX_DUMMY_HANDSHAKE);
++	else
++		limit = min_t(unsigned int, room, cfg->max_dummy);
++	return limit ? (u16)prandom_u32_max(limit) : 0;
++}
++
++static void stun_header(u8 *h, u16 type, u16 msg_len)
++{
++	put_unaligned_be16(type, h);
++	put_unaligned_be16(msg_len, h + 2);
++	put_unaligned_be32(STUN_COOKIE, h + 4);
++	get_random_bytes(h + 8, 12);
++}
++
++int wgobfs_encode_skb(const struct wgobfs_cfg *cfg, struct sk_buff *skb)
++{
++	unsigned int len, need_tail, head_extra;
++	u16 dummy = 0;
++	u8 *data, type, r;
++	int ret;
++
++	if (unlikely(skb_linearize(skb)))
++		return -ENOMEM;
++	len = skb->len;
++	if (unlikely(len < 4 || len > U16_MAX - WGOBFS_STUN_OVERHEAD))
++		return -EINVAL;
++
++	type = skb->data[0];
++	if (len < WGOBFS_MAX_TOTAL)
++		dummy = pick_dummy(cfg, type, len);
++
++	/* Room for the padding at the tail and the STUN header at the head,
++	 * on top of what the UDP/IP output path will push later.
++	 */
++	need_tail = dummy;
++	head_extra = cfg->masking == WGOBFS_MASKING_STUN ? WGOBFS_STUN_OVERHEAD : 0;
++	if (skb_cloned(skb) || skb_tailroom(skb) < need_tail ||
++	    skb_headroom(skb) < head_extra + LL_MAX_HEADER + 48 + 8) {
++		int dh = (int)(head_extra + LL_MAX_HEADER + 48 + 8) - (int)skb_headroom(skb);
++		int dt = (int)need_tail - (int)skb_tailroom(skb);
++
++		ret = pskb_expand_head(skb, dh > 0 ? ALIGN(dh, NET_SKB_PAD) : 0,
++				       dt > 0 ? dt : 0, GFP_ATOMIC);
++		if (unlikely(ret))
++			return ret;
++	}
++
++	data = skb->data;
++	r = 1 + (u8)prandom_u32_max(255);
++	data[0] ^= r;
++	data[1] = r;
++	if (len < WGOBFS_MAX_TOTAL) {
++		put_unaligned_le16(dummy, data + 2);
++		if (dummy)
++			memset(skb_put(skb, dummy), 0xFF, dummy);
++	}
++	keystream_xor(cfg, skb->data, skb->len);
++
++	if (cfg->masking == WGOBFS_MASKING_STUN) {
++		u16 payload = skb->len;
++		u8 *h = skb_push(skb, WGOBFS_STUN_OVERHEAD);
++
++		/* The message length stays 0, as wg-obfuscator sends it. */
++		stun_header(h, STUN_DATA_INDICATION, 0);
++		put_unaligned_be16(STUN_ATTR_DATA, h + 20);
++		put_unaligned_be16(payload, h + 22);
++	}
++	return 0;
++}
++
++int wgobfs_decode_skb(const struct wgobfs_cfg *cfg, struct sk_buff *skb)
++{
++	unsigned int len;
++	u8 *data;
++
++	if (unlikely(skb_linearize(skb)))
++		return -ENOMEM;
++	if (unlikely(skb_cloned(skb) && pskb_expand_head(skb, 0, 0, GFP_ATOMIC)))
++		return -ENOMEM;
++	if (skb->len < 4)
++		return -EINVAL;
++
++	/* STUN: unwrap Data Indications, drop everything else (Binding
++	 * requests/responses are keepalives of the masking layer).
++	 */
++	if (skb->len >= 8 && get_unaligned_be32(skb->data + 4) == STUN_COOKIE) {
++		unsigned int msg_len, dlen;
++
++		if (skb->len < WGOBFS_STUN_OVERHEAD ||
++		    get_unaligned_be16(skb->data) != STUN_DATA_INDICATION)
++			return -EPROTO;
++		msg_len = get_unaligned_be16(skb->data + 2);
++		dlen = get_unaligned_be16(skb->data + 22);
++		if (msg_len + 20 > skb->len ||
++		    get_unaligned_be16(skb->data + 20) != STUN_ATTR_DATA ||
++		    dlen + WGOBFS_STUN_OVERHEAD > skb->len)
++			return -EINVAL;
++		__skb_pull(skb, WGOBFS_STUN_OVERHEAD);
++		if (pskb_trim(skb, dlen))
++			return -ENOMEM;
++		if (skb->len < 4)
++			return -EINVAL;
++	}
++
++	data = skb->data;
++	len = skb->len;
++	keystream_xor(cfg, data, len);
++	if (!is_wg_type(data)) {
++		u16 dummy;
++
++		data[0] ^= data[1];
++		dummy = get_unaligned_le16(data + 2);
++		if (dummy > len - 4)
++			return -EINVAL;
++		len -= dummy;
++		data[1] = data[2] = data[3] = 0;
++		if (!is_wg_type(data))
++			return -EINVAL;
++		if (pskb_trim(skb, len))
++			return -ENOMEM;
++	}
++	/* else: version 0 peer (XOR only), the message is already plain. */
++	return 0;
++}
++
++int wgobfs_stun_binding_request(u8 *buf)
++{
++	u32 fp;
++
++	stun_header(buf, STUN_BINDING_REQUEST, 0);
++	put_unaligned_be16(STUN_ATTR_FINGERPRINT, buf + 20);
++	put_unaligned_be16(4, buf + 22);
++	/* FINGERPRINT covers the message up to the attribute (RFC 5389). */
++	fp = crc32_le(~0U, buf, 20) ^ ~0U;
++	put_unaligned_be32(fp ^ STUN_FINGERPRINT_XOR, buf + 24);
++	put_unaligned_be16(8, buf + 2);
++	return 28;
++}
+diff --git a/src/wgobfs.h b/src/wgobfs.h
+new file mode 100644
+index 0000000..8111ef5
+--- /dev/null
++++ b/src/wgobfs.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-2.0
++ *
++ * Client side of the wg-obfuscator wire protocol (ClusterM/wg-obfuscator,
++ * obfuscation version 1, optional STUN masking), so this module can talk to a
++ * wg-obfuscator server directly.
++ *
++ * Independent implementation written from the protocol description; no code
++ * of wg-obfuscator is used.
++ *
++ * Enabled through the AmneziaWG I5 parameter (see wgobfs_parse_spec()):
++ *   <b 0x57474F42 VV MM DDDD KK..>
++ *   57474F42 "WGOB" magic, VV format version (01), MM masking (00 none,
++ *   01 STUN), DDDD max dummy bytes for data packets (big-endian), KK.. key.
++ */
++
++#ifndef _WG_WGOBFS_H
++#define _WG_WGOBFS_H
++
++#include <linux/types.h>
++#include <linux/rcupdate.h>
++
++struct sk_buff;
++
++#define WGOBFS_KEY_MAX 255
++#define WGOBFS_STUN_OVERHEAD 24	/* STUN header + DATA attribute header */
++#define WGOBFS_MAX_TOTAL 1024	/* packets are padded up to this size at most */
++#define WGOBFS_MAX_DUMMY_HANDSHAKE 512
++
++enum wgobfs_masking {
++	WGOBFS_MASKING_NONE = 0,
++	WGOBFS_MASKING_STUN = 1,
++};
++
++struct wgobfs_cfg {
++	struct rcu_head rcu;
++	u8 masking;
++	u16 max_dummy;
++	u16 key_len;
++	u8 key[WGOBFS_KEY_MAX];
++};
++
++/* Returns 1 and fills @cfg when @spec is a WGOB I5 value, 0 when it is
++ * something else (a regular I5 junk spec), or a negative error when it has
++ * the magic but is malformed.
++ */
++int wgobfs_parse_spec(const char *spec, struct wgobfs_cfg *cfg);
++
++/* Obfuscates the WireGuard message in @skb in place (skb->data is the start
++ * of the message). May reallocate the skb head. Returns 0 or -errno.
++ */
++int wgobfs_encode_skb(const struct wgobfs_cfg *cfg, struct sk_buff *skb);
++
++/* Reverses wgobfs_encode_skb() on a received UDP payload (skb->data is the
++ * start of the payload, skb->len its length). Returns 0 when skb now holds a
++ * WireGuard message, or -errno when the packet must be dropped (garbage,
++ * wrong key, STUN control traffic).
++ */
++int wgobfs_decode_skb(const struct wgobfs_cfg *cfg, struct sk_buff *skb);
++
++/* Writes a STUN Binding Request into @buf (at least 28 bytes), returns its
++ * length.
++ */
++int wgobfs_stun_binding_request(u8 *buf);
++
++/* Seconds between STUN Binding Requests on an active connection. */
++#define WGOBFS_STUN_INTERVAL_S 10
++
++#endif /* _WG_WGOBFS_H */
