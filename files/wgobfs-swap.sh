@@ -70,6 +70,26 @@ genl_id() {
 	"$TOOL" genlid wireguard 2>/dev/null
 }
 
+# After the module is replaced NDM pushes keys and peers into the new
+# netdevs again, but not the ASC parameters: the WGOB value in I5 never
+# reaches the module and the tunnel stays plain WireGuard. Push the asc line
+# of every interface that has a WGOB value again. Sending the same value
+# twice is ignored by NDM, so it is cleared first and then restored.
+resend_wgob() {
+	ndmc -c 'show running-config' 2>/dev/null </dev/null | awk '
+		/^interface Wireguard[0-9]+/ { cur = $2; next }
+		/^!/ { cur = ""; next }
+		cur != "" && /^ +wireguard asc / && /<[bB] 0x57474[fF]42/ { sub(/^ +/, ""); print cur " " $0 }' |
+	while read -r i line; do
+		ndmc -c "interface $i wireguard asc 0 0 0 0 0 1 2 3 4 0 0 \"\" \"\" \"\" \"\" \"\"" >/dev/null 2>&1 </dev/null
+		if ndmc -c "interface $i $line" 2>&1 </dev/null | grep -qi error; then
+			say "$i: could not push the asc/I5 settings again"
+		else
+			say "$i: asc/I5 pushed to the module"
+		fi
+	done
+}
+
 ndm_bounce() {
 	for i in "$@"; do ndmc -c "interface $i down" >/dev/null 2>&1; done
 	sleep 1
@@ -140,6 +160,7 @@ reload() {
 	sleep 1
 	for i in $ups; do ndmc -c "interface $i up" >/dev/null 2>&1; done
 	sleep 3
+	resend_wgob
 	say "netdevs now: $(wg_netdevs | tr '\n' ' ')"
 	missing=""
 	for d in $devs; do [ -e "/sys/class/net/$d" ] || missing="$missing $d"; done
@@ -173,6 +194,8 @@ fix)
 		$IP link add "$d" type wireguard && say "recreated $d" || say "could not recreate $d"
 	done
 	ups=$(ndm_wg_up); ndm_bounce $ups
+	sleep 3
+	resend_wgob
 	say "netdevs now: $(wg_netdevs | tr '\n' ' ')" ;;
 i5)
 	shift
