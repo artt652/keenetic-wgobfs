@@ -58,7 +58,9 @@ KeeneticOS **5.2 Alpha 11 и новее**: с этой версии в KeeneticO
 
 ## Установка
 
-Нужны Entware и, для пересоздания интерфейсов, `ip-full` (ставится зависимостью).
+Нужны Entware и, для пересоздания интерфейсов, `ip-full` (ставится зависимостью). Репозиторий
+отдаётся по HTTPS, а busybox `wget`, которым по умолчанию пользуется opkg, HTTPS не умеет —
+сначала `opkg install wget-ssl ca-certificates`.
 
 ```sh
 opkg print-architecture                       # mipsel-3.4, mips-3.4 или aarch64-3.10
