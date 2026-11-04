@@ -60,6 +60,9 @@ EOF
 cat >"$W/ctrl/prerm" <<'EOF'
 #!/bin/sh
 /opt/etc/init.d/S05wgobfs disable >/dev/null 2>&1
+# The link to the module picked for this firmware is made at run time, so
+# opkg does not know it.
+rm -f /opt/lib/wgobfs/wireguard.ko
 echo "wgobfs: autostart disabled; reboot to get the stock module back."
 echo "        Tunnels in built-in mode keep the server endpoint: switch them first:"
 echo "        sh /opt/lib/wgobfs/wgobfs-mode.sh set WireguardN external <section>"
