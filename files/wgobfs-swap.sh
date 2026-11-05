@@ -84,8 +84,16 @@ resend_wgob() {
 		ndmc -c "interface $i wireguard asc 0 0 0 0 0 1 2 3 4 0 0 \"\" \"\" \"\" \"\" \"\"" >/dev/null 2>&1 </dev/null
 		if ndmc -c "interface $i $line" 2>&1 </dev/null | grep -qi error; then
 			say "$i: could not push the asc/I5 settings again"
-		else
-			say "$i: asc/I5 pushed to the module"
+			continue
+		fi
+		say "$i: asc/I5 pushed to the module"
+		# The ASC change makes NDM recreate the peer without its endpoint
+		# and keepalive; a restart of the interface brings them back.
+		if printf '%s\n' "$UPS" | grep -qx "$i"; then
+			ndmc -c "interface $i down" >/dev/null 2>&1 </dev/null
+			sleep 2
+			ndmc -c "interface $i up" >/dev/null 2>&1 </dev/null
+			say "$i: restarted"
 		fi
 	done
 }
@@ -160,7 +168,7 @@ reload() {
 	sleep 1
 	for i in $ups; do ndmc -c "interface $i up" >/dev/null 2>&1; done
 	sleep 3
-	resend_wgob
+	UPS=$ups resend_wgob
 	say "netdevs now: $(wg_netdevs | tr '\n' ' ')"
 	missing=""
 	for d in $devs; do [ -e "/sys/class/net/$d" ] || missing="$missing $d"; done
@@ -195,7 +203,7 @@ fix)
 	done
 	ups=$(ndm_wg_up); ndm_bounce $ups
 	sleep 3
-	resend_wgob
+	UPS=$ups resend_wgob
 	say "netdevs now: $(wg_netdevs | tr '\n' ' ')" ;;
 i5)
 	shift

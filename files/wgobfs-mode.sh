@@ -87,7 +87,7 @@ apply_internal() {
 			ndm_ok "interface $iface wireguard asc $a \"$i5\"" && { ok=1; break; }
 		done
 		[ $ok = 1 ] || { say "$iface: router did not accept ASC/I5"; return 1; }
-		CHANGED=1
+		CHANGED=1 ASC_CHANGED=1
 	fi
 	set_endpoint "$iface" "$target" "$blk"
 }
@@ -102,7 +102,7 @@ apply_external() {
 		ndm_ok "interface $iface wireguard asc 0 0 0 0 0 1 2 3 4 0 0 \"\" \"\" \"\" \"\" \"\"" ||
 			ndm_ok "interface $iface no wireguard asc" ||
 			{ patched && { say "$iface: cannot clear I5, external mode would obfuscate twice"; return 1; }; }
-		CHANGED=1
+		CHANGED=1 ASC_CHANGED=1
 	fi
 	if [ -x "$OBFINIT" ] && ! pidof wg-obfuscator >/dev/null 2>&1; then
 		"$OBFINIT" start >/dev/null 2>&1 </dev/null && say "started the external obfuscator"
@@ -121,8 +121,19 @@ set_endpoint() {
 	say "$iface: endpoint $cur -> $ep"
 }
 
+# A changed ASC makes NDM recreate the peer in the module without its
+# endpoint and keepalive, and the tunnel stays silent (txbytes 0) until the
+# interface is restarted. Restart it when it is configured up.
+restart_if_up() {
+	printf '%s\n' "$2" | grep -q '^ *up *$' || return 0
+	ndmc -c "interface $1 down" >/dev/null 2>&1 </dev/null
+	sleep 2
+	ndmc -c "interface $1 up" >/dev/null 2>&1 </dev/null
+	say "$1: restarted to apply the new ASC settings"
+}
+
 apply_one() {
-	iface=$1 mode=$2 sec=$3
+	iface=$1 mode=$2 sec=$3 ASC_CHANGED=0
 	blk=$(rc_block "$iface")
 	[ -n "$blk" ] || { say "$iface: not in the router configuration"; return 1; }
 	e=$(eff_mode "$mode")
@@ -130,7 +141,9 @@ apply_one() {
 	internal) apply_internal "$iface" "$sec" "$blk" ;;
 	external) apply_external "$iface" "$sec" "$blk" ;;
 	*) return 0 ;;
-	esac && say "$iface: $mode -> $e"
+	esac || return 1
+	[ "$ASC_CHANGED" = 0 ] || restart_if_up "$iface" "$blk"
+	say "$iface: $mode -> $e"
 }
 
 apply() {
