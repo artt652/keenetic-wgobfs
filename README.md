@@ -65,7 +65,7 @@ KeeneticOS **5.2 Alpha 11 и новее**: с этой версии в KeeneticO
 ```sh
 opkg print-architecture                       # mipsel-3.4, mips-3.4 или aarch64-3.10
 ARCH=mipsel-3.4
-echo "src/gz wgobfs https://artt652.github.io/keenetic-wgobfs/$ARCH" >> /opt/etc/opkg.conf
+grep -q keenetic-wgobfs /opt/etc/opkg.conf || echo "src/gz wgobfs https://artt652.github.io/keenetic-wgobfs/$ARCH" >> /opt/etc/opkg.conf
 opkg update && opkg install wgobfs-kmod
 sh /opt/lib/wgobfs/wgobfs-swap.sh select     # какой модуль подошёл
 sh /opt/lib/wgobfs/wgobfs-swap.sh swap       # подменить сейчас (или перезагрузить роутер)
